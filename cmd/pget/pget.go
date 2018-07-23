@@ -63,7 +63,7 @@ func main() {
 	if getter, err = pget.NewPGet(fileURL, ckmFileName, outDir, maxconn); err != nil {
 		log.Fatalf("got error %+v", err)
 	}
-	if err := getter.DoParallel(cont); err != nil {
+	if _, err := getter.DoParallel(cont); err != nil {
 		log.Fatalf("got error %+v", err)
 	}
 }

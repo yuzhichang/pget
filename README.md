@@ -1,6 +1,6 @@
 # pget
 
-Multiple-thread download tool, inspired by lftp's "pget -c -n".
+Parallel, continuable HTTP download tool, inspired by lftp's "pget -c -n".
 
 Example:
 

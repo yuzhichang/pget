@@ -115,8 +115,19 @@ func (pg *PGet) getChecksum() (ckm string, err error) {
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
 		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[1] == fileName {
+		switch len(fields) {
+		case 1:
 			ckm = fields[0]
+		case 2:
+			if fields[1][0] == '*' {
+				fields[1] = fields[1][1:]
+			}
+			if fields[1] == fileName {
+				ckm = fields[0]
+			}
+		}
+		if ckm != "" {
+			break
 		}
 	}
 	if ckm == "" {
@@ -171,7 +182,7 @@ func (pg *PGet) getFileLen() (length int, err error) {
 	return
 }
 
-func (pg *PGet) DoParallel(cont bool) (err error) {
+func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
 	var flag int
 	var fileLen int
 	if cont {
@@ -315,7 +326,8 @@ func (pg *PGet) DoParallel(cont bool) (err error) {
 		log.Errorf("a thread got fatal error %+v", err)
 	}
 	if taskErr != nil {
-		return taskErr
+		err = taskErr
+		return
 	}
 	if cont {
 		if err = pg.doneStatus(); err != nil {
@@ -334,5 +346,6 @@ func (pg *PGet) DoParallel(cont bool) (err error) {
 		}
 	}
 
+	filePath = pg.filePath
 	return
 }
