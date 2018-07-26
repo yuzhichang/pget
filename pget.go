@@ -44,6 +44,7 @@ func NewPGet(fileURL, ckmFileName, outDir string, maxconn int) (pg *PGet, err er
 		MaxConn:     maxconn,
 	}
 	if pg.FileURL, err = pg.FileURL.Parse(fileURL); err != nil {
+		err = errors.Wrapf(err, "")
 		return
 	}
 	fileName := filepath.Base(pg.FileURL.Path)
@@ -54,14 +55,17 @@ func NewPGet(fileURL, ckmFileName, outDir string, maxconn int) (pg *PGet, err er
 
 func (pg *PGet) prepareStatus() (err error) {
 	if pg.statusFile, err = os.OpenFile(pg.statusPath, os.O_RDWR|os.O_CREATE, 0600); err != nil {
+		err = errors.Wrapf(err, "")
 		return
 	}
 	var info os.FileInfo
 	if info, err = pg.statusFile.Stat(); err != nil {
+		err = errors.Wrapf(err, "")
 		return
 	}
 	if info.Size() != int64(24*pg.MaxConn) {
 		if err = pg.statusFile.Truncate(0); err != nil {
+			err = errors.Wrapf(err, "")
 			return
 		}
 		var fileLen int
@@ -112,6 +116,10 @@ func (pg *PGet) getChecksum() (ckm string, err error) {
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		err = errors.Wrapf(err, "")
+		return
+	}
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
 		fields := strings.Fields(line)
@@ -172,6 +180,10 @@ func (pg *PGet) getFileLen() (length int, err error) {
 	res, err := http.Head(pg.FileURL.String())
 	if err != nil {
 		err = errors.Wrapf(err, "")
+		return
+	}
+	if res.StatusCode != 200 {
+		err = errors.Errorf("res.StatusCode=%d is unexpected", res.StatusCode)
 		return
 	}
 	maps := res.Header
