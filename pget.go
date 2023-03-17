@@ -1,6 +1,7 @@
 package pget
 
 import (
+	"context"
 	"crypto"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,13 +12,16 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
+	"github.com/thanos-io/thanos/pkg/errors"
+	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -25,57 +29,75 @@ const (
 	MaxCntErr = 10
 )
 
+var (
+	hashProgs = []string{"md5", "sha1", "sha256", "sha512"}
+	// https://stuartleeks.com/posts/connection-re-use-in-golang-with-http-client/
+	clientPool = sync.Pool{New: func() interface{} {
+		return &http.Client{Transport: &http.Transport{IdleConnTimeout: 10 * time.Second}}
+	}}
+	pgSeq atomic.Int64
+)
+
 type PGet struct {
-	FileURL     *url.URL
-	CkmFileName string
-	OutDir      string
-	MaxConn     int
+	fileURL     string
+	ckmFileName string
+	outDir      string
+	maxconn     int
+	logger      *zap.Logger
+	sem         *semaphore.Weighted
+	seq         int64
 	wg          sync.WaitGroup
+	fileURI     *url.URL
 	filePath    string
 	statusPath  string
 	statusFile  *os.File
 	statusData  []byte
 }
 
-func NewPGet(fileURL, ckmFileName, outDir string, maxconn int) (pg *PGet, err error) {
+func NewPGet(fileURL, ckmFileName, outDir string, maxconn int) (pg *PGet) {
 	pg = &PGet{
-		CkmFileName: ckmFileName,
-		OutDir:      outDir,
-		MaxConn:     maxconn,
+		fileURL:     fileURL,
+		ckmFileName: ckmFileName,
+		outDir:      outDir,
+		maxconn:     maxconn,
+		logger:      zap.NewNop(),
+		sem:         semaphore.NewWeighted(int64(maxconn)),
+		seq:         pgSeq.Add(1),
 	}
-	if pg.FileURL, err = pg.FileURL.Parse(fileURL); err != nil {
-		err = errors.Wrapf(err, "")
-		return
-	}
-	fileName := filepath.Base(pg.FileURL.Path)
-	pg.filePath = filepath.Join(outDir, fileName)
-	pg.statusPath = filepath.Join(outDir, fmt.Sprintf("%s.pget-status", fileName))
 	return
+}
+func (pg *PGet) WithLogger(l *zap.Logger) *PGet {
+	pg.logger = l
+	return pg
+}
+func (pg *PGet) WithSemaphore(sem *semaphore.Weighted) *PGet {
+	pg.sem = sem
+	return pg
 }
 
 func (pg *PGet) prepareStatus() (err error) {
 	if pg.statusFile, err = os.OpenFile(pg.statusPath, os.O_RDWR|os.O_CREATE, 0600); err != nil {
-		err = errors.Wrapf(err, "")
+		err = errors.Wrapf(err, fmt.Sprintf("pg %d", pg.seq))
 		return
 	}
 	var info os.FileInfo
 	if info, err = pg.statusFile.Stat(); err != nil {
-		err = errors.Wrapf(err, "")
+		err = errors.Wrapf(err, fmt.Sprintf("pg %d", pg.seq))
 		return
 	}
-	if info.Size() != int64(24*pg.MaxConn) {
+	if info.Size() != int64(24*pg.maxconn) {
 		if err = pg.statusFile.Truncate(0); err != nil {
-			err = errors.Wrapf(err, "")
+			err = errors.Wrapf(err, fmt.Sprintf("pg %d", pg.seq))
 			return
 		}
 		var fileLen int
 		if fileLen, err = pg.getFileLen(); err != nil {
 			return
 		}
-		for i := 0; i < pg.MaxConn; i++ {
-			min := int64((fileLen / pg.MaxConn) * i)       // Min range
-			max := int64((fileLen / pg.MaxConn) * (i + 1)) // Max range
-			if i == pg.MaxConn-1 {
+		for i := 0; i < pg.maxconn; i++ {
+			min := int64((fileLen / pg.maxconn) * i)       // Min range
+			max := int64((fileLen / pg.maxconn) * (i + 1)) // Max range
+			if i == pg.maxconn-1 {
 				max = int64(fileLen) // Add the remaining bytes in the last request
 			}
 			offset := min
@@ -97,27 +119,61 @@ func (pg *PGet) doneStatus() (err error) {
 	return
 }
 
-// download and parse checksum file
-func (pg *PGet) getChecksum() (ckm string, err error) {
-	ckmURL := *pg.FileURL
-	ckmURL.Path = filepath.Join(filepath.Dir(pg.FileURL.Path), pg.CkmFileName)
+func (pg *PGet) expectChecksum() (hashProg, ckm string, err error) {
+	// checksum can be encoded in url fragment
+	if pg.fileURI.Fragment != "" {
+		kv := strings.Split(pg.fileURI.Fragment, "=")
+		if len(kv) == 2 {
+			for _, prog := range hashProgs {
+				if prog == kv[0] {
+					hashProg = prog
+					ckm = kv[1]
+					return
+				}
+			}
+		}
+	}
+	// download and parse checksum file
+	if pg.ckmFileName == "" {
+		return
+	}
+	suffix := filepath.Ext(strings.ToLower(pg.ckmFileName))
+	if len(suffix) <= 1 {
+		err = errors.Newf("pg %d checksum file name %s is invalid", pg.seq, pg.ckmFileName)
+		return
+	}
+	suffix = suffix[1:]
+	for _, prog := range hashProgs {
+		if suffix == prog {
+			hashProg = prog
+			break
+		}
+	}
+	if hashProg == "" {
+		err = errors.Newf("pg %d checksum file name %s is invalid", pg.seq, pg.ckmFileName)
+		return
+	}
+	ckmURL := *pg.fileURI
+	ckmURL.Path = filepath.Join(filepath.Dir(pg.fileURI.Path), pg.ckmFileName)
 	fileName := filepath.Base(pg.filePath)
 
-	resp, err := http.Get(ckmURL.String())
+	client := clientPool.Get().(*http.Client)
+	defer clientPool.Put(client)
+	resp, err := client.Get(ckmURL.String())
 	if err != nil {
 		err = errors.Wrapf(err, "")
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		err = errors.Errorf("resp.StatusCode=%d is unexpected", resp.StatusCode)
+		err = errors.Newf("pg %d resp.StatusCode=%d is unexpected", pg.seq, resp.StatusCode)
 		return
 
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		err = errors.Wrapf(err, "")
+		err = errors.Wrapf(err, fmt.Sprintf("pg %d", pg.seq))
 		return
 	}
 	lines := strings.Split(string(body), "\n")
@@ -139,37 +195,36 @@ func (pg *PGet) getChecksum() (ckm string, err error) {
 		}
 	}
 	if ckm == "" {
-		err = errors.Errorf("could not locate checksum for %s in %s", pg.FileURL.String(), ckmURL.String())
-		log.Debugf("checksum file: %v", string(body))
+		err = errors.Newf("pg %d could not locate checksum for %s in %s", pg.seq, pg.fileURL, ckmURL.String())
 		return
 	}
 	return
 }
 
-func (pg *PGet) calcChecksum() (ckm string, err error) {
-	ckmFileName := strings.ToLower(pg.CkmFileName)
+func (pg *PGet) calcChecksum(hash string) (ckm string, err error) {
 	var h crypto.Hash
-	if strings.Index(ckmFileName, "md5") >= 0 {
+	switch hash {
+	case "md5":
 		h = crypto.MD5
-	} else if strings.Index(ckmFileName, "sha512") >= 0 {
-		h = crypto.SHA512
-	} else if strings.Index(ckmFileName, "sha256") >= 0 {
-		h = crypto.SHA256
-	} else if strings.Index(ckmFileName, "sha1") >= 0 {
+	case "sha1":
 		h = crypto.SHA1
-	} else {
-		err = errors.Errorf("unsupported checksum %s", ckmFileName)
+	case "sha256":
+		h = crypto.SHA256
+	case "sha512":
+		h = crypto.SHA512
+	default:
+		err = errors.Newf("pg %d unsupported hash program %s", pg.seq, hash)
 		return
 	}
 	hasher := h.New()
 	var f2 *os.File
 	if f2, err = os.Open(pg.filePath); err != nil {
-		err = errors.Wrapf(err, "")
+		err = errors.Wrapf(err, fmt.Sprintf("pg %d", pg.seq))
 		return
 	}
 	defer f2.Close()
 	if _, err = io.Copy(hasher, f2); err != nil {
-		err = errors.Wrapf(err, "")
+		err = errors.Wrapf(err, fmt.Sprintf("pg %d", pg.seq))
 		return
 	}
 	ckm = hex.EncodeToString(hasher.Sum(nil))
@@ -177,13 +232,16 @@ func (pg *PGet) calcChecksum() (ckm string, err error) {
 }
 
 func (pg *PGet) getFileLen() (length int, err error) {
-	res, err := http.Head(pg.FileURL.String())
+	client := clientPool.Get().(*http.Client)
+	defer clientPool.Put(client)
+	res, err := client.Head(pg.fileURI.String())
 	if err != nil {
-		err = errors.Wrapf(err, "")
+		err = errors.Wrapf(err, fmt.Sprintf("pg %d", pg.seq))
 		return
 	}
+	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		err = errors.Errorf("res.StatusCode=%d is unexpected", res.StatusCode)
+		err = errors.Newf("pg %d res.StatusCode=%d is unexpected", pg.seq, res.StatusCode)
 		return
 	}
 	maps := res.Header
@@ -194,7 +252,30 @@ func (pg *PGet) getFileLen() (length int, err error) {
 	return
 }
 
-func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
+func (pg *PGet) DoParallel(ctx context.Context, cont bool) (filePath string, err error) {
+	if pg.fileURI, err = url.Parse(pg.fileURL); err != nil {
+		err = errors.Wrapf(err, fmt.Sprintf("pg %d", pg.seq))
+		return
+	}
+	fileName := filepath.Base(pg.fileURI.Path)
+	pg.filePath = filepath.Join(pg.outDir, fileName)
+	pg.statusPath = filepath.Join(pg.outDir, fmt.Sprintf("%s.pget-status", fileName))
+	filePath = pg.filePath
+	// skip downloading if the file already exists and the checksum match
+	var hashProg, expCkm, actCkm string
+	if hashProg, expCkm, err = pg.expectChecksum(); err != nil {
+		return
+	}
+	pg.logger.Debug("expectChecksum", zap.Int64("pg", pg.seq), zap.String("filePath", pg.filePath), zap.String("hashProg", hashProg), zap.String("expCkm", expCkm))
+	if expCkm != "" {
+		if actCkm, err = pg.calcChecksum(hashProg); err == nil && actCkm == expCkm {
+			pg.logger.Debug("checksum match, skip downloading", zap.Int64("pg", pg.seq))
+			return
+		}
+		pg.logger.Debug("checksum mismatch", zap.Int64("pg", pg.seq), zap.String("actCkm", actCkm), zap.String("expCkm", expCkm))
+	}
+
+	// download file
 	var flag int
 	var fileLen int
 	if cont {
@@ -217,47 +298,54 @@ func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
 	}
 	defer f.Close()
 
-	errCh := make(chan error, pg.MaxConn)
-	for i := 0; i < pg.MaxConn; i++ {
+	errCh := make(chan error, pg.maxconn)
+	for i := 0; i < pg.maxconn; i++ {
 		pg.wg.Add(1)
+		if err = pg.sem.Acquire(context.Background(), 1); err != nil {
+			err = errors.Wrapf(err, "pg %d failed to acquire semaphore", pg.seq)
+			return
+		}
 
 		go func(i int, errCh chan error) {
 			var err error
 			var n int
 			var min, max, off int64
+			defer pg.wg.Done()
+			defer pg.sem.Release(1)
 			if cont {
 				min = int64(binary.BigEndian.Uint64(pg.statusData[24*i:]))
 				max = int64(binary.BigEndian.Uint64(pg.statusData[24*i+8:]))
 				off = int64(binary.BigEndian.Uint64(pg.statusData[24*i+16:]))
 			} else {
-				min = int64((fileLen / pg.MaxConn) * i)       // Min range
-				max = int64((fileLen / pg.MaxConn) * (i + 1)) // Max range
-				if i == pg.MaxConn-1 {
+				min = int64((fileLen / pg.maxconn) * i)       // Min range
+				max = int64((fileLen / pg.maxconn) * (i + 1)) // Max range
+				if i == pg.maxconn-1 {
 					max = int64(fileLen) // Add the remaining bytes in the last request
 				}
 				off = min
 			}
-			log.Debugf("thread %d, min %d, max %d, off %d", i, min, max, off)
+			pg.logger.Debug("thread begin", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.Int64("max", max), zap.Int64("off", off), zap.Int64("remained", max-off))
 			buf := make([]byte, BufSize, BufSize)
 			var cntErr int
-			client := &http.Client{}
+			client := clientPool.Get().(*http.Client)
+			defer clientPool.Put(client)
 			for off < max && cntErr < MaxCntErr {
 				min = off
-				req, _ := http.NewRequest("GET", pg.FileURL.String(), nil)
+				req, _ := http.NewRequest("GET", pg.fileURL, nil)
+				req = req.WithContext(ctx)
 				rangeHeader := fmt.Sprintf("bytes=%d-%d", off, max-1)
-				log.Debugf("thread %d, %s", i, rangeHeader)
+				pg.logger.Debug("thread GET", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.String("range", rangeHeader))
 				req.Header.Add("Range", rangeHeader)
 				resp, err := client.Do(req)
 				if err != nil {
-					err = errors.Wrapf(err, "")
+					err = errors.Wrapf(err, fmt.Sprintf("pg %d, thread %d", pg.seq, i))
 					cntErr++
 					if cntErr >= MaxCntErr {
 						goto QUIT
 					} else {
-						continue
+						goto CONT
 					}
 				}
-				defer resp.Body.Close()
 				if resp.StatusCode == 429 {
 					// https://httpstatuses.com/429
 					wait := 3600
@@ -268,20 +356,20 @@ func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
 						if cntErr >= MaxCntErr {
 							goto QUIT
 						} else {
-							continue
+							goto CONT
 						}
 					}
-					log.Debugf("thread %d, Retry-After %s", i, waitStr)
+					pg.logger.Debug("thread got status code 429", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.String("Retry-After", waitStr))
 					time.Sleep(time.Duration(wait) * time.Microsecond)
-					continue
+					goto CONT
 				} else if resp.StatusCode != 206 {
 					// Go already handled redirection. http://colobu.com/2017/04/19/go-http-redirect/
-					log.Errorf("resp.StatusCode=%d is unexpected!", resp.StatusCode)
+					pg.logger.Debug("thread got unexpected non-206 status code", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.Int("code", resp.StatusCode))
 					cntErr++
 					if cntErr >= MaxCntErr {
 						goto QUIT
 					} else {
-						continue
+						goto CONT
 					}
 				}
 
@@ -290,7 +378,7 @@ func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
 					n, err = resp.Body.Read(buf)
 					if n > 0 {
 						if _, err = f.WriteAt(buf[:n], off); err != nil {
-							err = errors.Wrapf(err, "")
+							err = errors.Wrapf(err, fmt.Sprintf("pg %d, thread %d", pg.seq, i))
 							goto QUIT
 						}
 					}
@@ -303,8 +391,8 @@ func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
 						break
 					}
 					if err != nil {
-						err = errors.Wrapf(err, "")
-						log.Debugf("resp.StatusCode=%d, n=%d, written=%d, err=%+v", resp.StatusCode, n, off-min, err)
+						err = errors.Wrapf(err, "pg %d, thread %d", pg.seq, i)
+						pg.logger.Warn("thread got error", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.Int("code", resp.StatusCode), zap.Error(err), zap.Int64("written", off-min))
 						cntErr++
 						if cntErr >= MaxCntErr {
 							goto QUIT
@@ -313,21 +401,17 @@ func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
 						}
 					}
 				}
+			CONT:
+				if resp != nil {
+					resp.Body.Close()
+				}
 			}
 		QUIT:
 			if err != nil {
 				errCh <- err
 			}
-			pg.wg.Done()
+			pg.logger.Debug("thread end", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.Int64("max", max), zap.Int64("off", off), zap.Int64("remained", max-off))
 		}(i, errCh)
-	}
-
-	// Download checksum file
-	var ckm, ckm2 string
-	if pg.CkmFileName != "" {
-		if ckm, err = pg.getChecksum(); err != nil {
-			return
-		}
 	}
 
 	pg.wg.Wait()
@@ -335,7 +419,6 @@ func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
 	var taskErr error
 	for err = range errCh {
 		taskErr = err
-		log.Errorf("a thread got fatal error %+v", err)
 	}
 	if taskErr != nil {
 		err = taskErr
@@ -348,16 +431,85 @@ func (pg *PGet) DoParallel(cont bool) (filePath string, err error) {
 	}
 
 	// Verify checksum
-	if pg.CkmFileName != "" {
-		if ckm2, err = pg.calcChecksum(); err != nil {
+	if expCkm != "" {
+		if actCkm, err = pg.calcChecksum(hashProg); err != nil {
 			return
 		}
-		if ckm != ckm2 {
-			err = errors.Errorf("checksum mismatch, have %v, want %v", ckm2, ckm)
+		if actCkm != expCkm {
+			err = errors.Newf("pg %d checksum mismatch, have %v, want %v", pg.seq, actCkm, expCkm)
 			return
 		}
 	}
+	pg.logger.Info("done downloading", zap.Int64("pg", pg.seq), zap.String("filePath", pg.filePath))
+	return
+}
 
-	filePath = pg.filePath
+type MGet struct {
+	fileURLs     []string
+	ckmFileNames []string
+	outDir       string
+	maxconn      int
+	logger       *zap.Logger
+	semPg        *semaphore.Weighted
+	semTask      *semaphore.Weighted
+}
+
+func NewMGet(fileURLs, ckmFileNames []string, outDir string, maxconn int) (mg *MGet) {
+	mg = &MGet{
+		fileURLs:     fileURLs,
+		ckmFileNames: ckmFileNames,
+		outDir:       outDir,
+		maxconn:      maxconn,
+		logger:       zap.NewNop(),
+		semPg:        semaphore.NewWeighted(int64(maxconn)),
+		semTask:      semaphore.NewWeighted(int64(maxconn)),
+	}
+	return
+}
+func (mg *MGet) WithLogger(l *zap.Logger) *MGet {
+	mg.logger = l
+	return mg
+}
+func (mg *MGet) DoParallel(ctx context.Context, cont bool) (filePaths []string, err error) {
+	var wg sync.WaitGroup
+	fpCh := make(chan string, len(mg.fileURLs))
+	errCh := make(chan error, len(mg.fileURLs))
+	for i, fileURL := range mg.fileURLs {
+		var ckmFileName string
+		if len(mg.ckmFileNames) > i {
+			ckmFileName = mg.ckmFileNames[i]
+		}
+		wg.Add(1)
+		if err = mg.semPg.Acquire(ctx, 1); err != nil {
+			err = errors.Wrapf(err, "failed to acquire semaphore")
+			return
+		}
+		go func(fileURL, ckmFileName string) {
+			defer wg.Done()
+			defer mg.semPg.Release(1)
+			var filePath string
+			if filePath, err = NewPGet(fileURL, ckmFileName, mg.outDir, mg.maxconn).WithLogger(mg.logger).WithSemaphore(mg.semTask).DoParallel(ctx, cont); err != nil {
+				errCh <- err
+				return
+			}
+			fpCh <- filePath
+		}(fileURL, ckmFileName)
+	}
+	wg.Wait()
+FOR:
+	for {
+		select {
+		case filePath := <-fpCh:
+			filePaths = append(filePaths, filePath)
+		case err2 := <-errCh:
+			err = err2
+		default:
+			break FOR
+		}
+	}
+	if err != nil {
+		return
+	}
+	sort.Strings(filePaths)
 	return
 }

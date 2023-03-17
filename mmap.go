@@ -4,15 +4,15 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/errors"
 )
 
-//FileMmap mmaps the given file.
-//https://medium.com/@arpith/adventures-with-mmap-463b33405223
+// FileMmap mmaps the given file.
+// https://medium.com/@arpith/adventures-with-mmap-463b33405223
 func FileMmap(f *os.File) (data []byte, err error) {
 	info, err1 := f.Stat()
 	if err1 != nil {
-		err = errors.Wrap(err1, "")
+		err = errors.Wrapf(err1, "")
 		return
 	}
 	prots := []int{syscall.PROT_WRITE | syscall.PROT_READ, syscall.PROT_READ}
@@ -23,17 +23,17 @@ func FileMmap(f *os.File) (data []byte, err error) {
 		}
 	}
 	if err != nil {
-		err = errors.Wrap(err, "")
+		err = errors.Wrapf(err, "")
 		return
 	}
 	return
 }
 
-//FileMunmap unmaps the given file.
+// FileMunmap unmaps the given file.
 func FileMunmap(data []byte) (err error) {
 	err = syscall.Munmap(data)
 	if err != nil {
-		err = errors.Wrap(err, "")
+		err = errors.Wrapf(err, "")
 		return
 	}
 	return
