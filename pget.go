@@ -298,7 +298,7 @@ func (pg *PGet) DoParallel(ctx context.Context, cont bool) (filePath string, err
 	}
 	defer f.Close()
 
-	errCh := make(chan error, pg.maxconn)
+	errCh := make(chan error, pg.maxconn*MaxCntErr)
 	for i := 0; i < pg.maxconn; i++ {
 		pg.wg.Add(1)
 		if err = pg.sem.Acquire(context.Background(), 1); err != nil {
@@ -339,6 +339,7 @@ func (pg *PGet) DoParallel(ctx context.Context, cont bool) (filePath string, err
 				resp, err := client.Do(req)
 				if err != nil {
 					err = errors.Wrapf(err, fmt.Sprintf("pg %d, thread %d", pg.seq, i))
+					errCh <- err
 					cntErr++
 					if cntErr >= MaxCntErr {
 						goto QUIT
@@ -346,25 +347,28 @@ func (pg *PGet) DoParallel(ctx context.Context, cont bool) (filePath string, err
 						goto CONT
 					}
 				}
+				pg.logger.Debug("thread GET response", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.Int("status code", resp.StatusCode), zap.Any("header", resp.Header))
 				if resp.StatusCode == 429 {
 					// https://httpstatuses.com/429
-					wait := 3600
-					waitStr := resp.Header.Get("Retry-After")
-					if waitStr != "" {
-						wait, err = strconv.Atoi(waitStr)
-						cntErr++
-						if cntErr >= MaxCntErr {
-							goto QUIT
-						} else {
-							goto CONT
+					wait := 10
+					if waitStr := resp.Header.Get("Retry-After"); waitStr != "" {
+						if wait2, err2 := strconv.Atoi(waitStr); err2 == nil {
+							wait = wait2
 						}
 					}
-					pg.logger.Debug("thread got status code 429", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.String("Retry-After", waitStr))
-					time.Sleep(time.Duration(wait) * time.Microsecond)
-					goto CONT
+					err = errors.Newf("pg %d, thread %d, Retry-After %d s", pg.seq, i, wait)
+					errCh <- err
+					cntErr++
+					if cntErr >= MaxCntErr {
+						goto QUIT
+					} else {
+						time.Sleep(time.Duration(wait) * time.Second)
+						goto CONT
+					}
 				} else if resp.StatusCode != 206 {
 					// Go already handled redirection. http://colobu.com/2017/04/19/go-http-redirect/
-					pg.logger.Debug("thread got unexpected non-206 status code", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.Int("code", resp.StatusCode))
+					err = errors.Newf("pg %d, thread %d, status code %d", pg.seq, i, resp.StatusCode)
+					errCh <- err
 					cntErr++
 					if cntErr >= MaxCntErr {
 						goto QUIT
@@ -407,10 +411,7 @@ func (pg *PGet) DoParallel(ctx context.Context, cont bool) (filePath string, err
 				}
 			}
 		QUIT:
-			if err != nil {
-				errCh <- err
-			}
-			pg.logger.Debug("thread end", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.Int64("max", max), zap.Int64("off", off), zap.Int64("remained", max-off))
+			pg.logger.Debug("thread end", zap.Int64("pg", pg.seq), zap.Int("thread", i), zap.Int64("max", max), zap.Int64("off", off), zap.Int64("remained", max-off), zap.Error(err))
 		}(i, errCh)
 	}
 
@@ -418,7 +419,9 @@ func (pg *PGet) DoParallel(ctx context.Context, cont bool) (filePath string, err
 	close(errCh)
 	var taskErr error
 	for err = range errCh {
-		taskErr = err
+		if err != nil {
+			taskErr = err
+		}
 	}
 	if taskErr != nil {
 		err = taskErr
